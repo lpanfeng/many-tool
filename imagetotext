@@ -1,0 +1,363 @@
+import time
+import random
+import json
+import os
+import datetime
+import pandas as pd
+import google.generativeai as genai
+from PIL import Image
+from openpyxl import Workbook
+
+# --- Configuration ---
+# Configure API key (replace with your actual key or use secrets manager for security)
+# 配置API密钥（替换为您的实际密钥或使用Secrets Manager以提高安全性）
+# It is highly recommended to use Colab's Secrets Manager for storing API keys.
+# 强烈建议使用Colab的Secrets Manager来存储API密钥。
+# Access it via the key icon in the left sidebar and add your key with the name 'GOOGLE_API_KEY'.
+# 通过左侧边栏的钥匙图标访问它，并添加您的密钥，名称为'GOOGLE_API_KEY'。
+# Then uncomment the lines below to load the key securely.
+# 然后取消注释下面的行以安全地加载密钥。
+# from google.colab import userdata
+# API_KEY = userdata.get('GOOGLE_API_KEY')
+# genai.configure(api_key=API_KEY)
+
+# For demonstration purposes, using a placeholder API key. Replace with your actual key.
+# 出于演示目的，使用占位符API密钥。请替换为您的实际密钥。
+genai.configure(api_key='AIzaSyBcx0DOS3OrL7zKqgAcgIc5eBYHcdE6GTg')
+
+
+# Set image folder and output Excel file path
+# 设置图片文件夹和输出Excel文件路径
+# Make sure to upload your images to this folder in the Colab environment.
+# 确保将您的图片上传到Colab环境中的此文件夹。
+image_folder = '/content/image'
+output_excel_file = '/content/excel/output.xlsx'
+
+# List of models to try in order of preference
+# 按偏好顺序列出要尝试的模型
+models_to_try = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']
+
+# Define daily rate limits (RPD) based on the free tier from the documentation:
+# https://ai.google.dev/gemini-api/docs/rate-limits?hl=zh-cn
+# 定义基于文档中免费层级的每日速率限制 (RPD)：
+# https://ai.google.dev/gemini-api/docs/rate-limits?hl=zh-cn
+# Please verify these limits against the latest documentation as they may change.
+# 请根据最新的文档验证这些限制，因为它们可能会发生变化。
+rate_limits_rpd = {
+    'gemini-2.5-pro': 1500,  # Example RPD limit for gemini-2.5-pro (replace with actual)
+    # gemini-2.5-pro 的示例 RPD 限制（替换为实际值）
+    'gemini-2.5-flash': 1500, # Example RPD limit for gemini-2.5-flash (replace with actual)
+    # gemini-2.5-flash 的示例 RPD 限制（替换为实际值）
+    'gemini-2.5-flash-lite': 1500 # Example RPD limit for gemini-2.5-flash-lite (replace with actual)
+    # gemini-2.5-flash-lite 的示例 RPD 限制（替换为实际值）
+}
+
+# File to store daily usage and last saved date
+# 用于存储每日使用量和上次保存日期的文件
+usage_file = 'daily_usage.json'
+
+# Initialize daily usage dictionary
+# 初始化每日使用量字典
+daily_usage = {
+    'gemini-2.5-pro': 0,
+    'gemini-2.5-flash': 0,
+    'gemini-2.5-flash-lite': 0
+}
+
+# Get current date
+# 获取当前日期
+today = datetime.date.today().isoformat()
+
+# Load previous daily usage data if the file exists
+# 如果文件存在，则加载之前的每日使用量数据
+if os.path.exists(usage_file):
+    try:
+        with open(usage_file, 'r') as f:
+            data = json.load(f)
+            last_saved_date = data.get('date')
+            saved_usage = data.get('usage')
+
+            # If the last saved date is today, load the saved usage
+            # 如果上次保存的日期是今天，则加载保存的使用量
+            if last_saved_date == today and saved_usage is not None:
+                # Update daily_usage with saved values, ensuring all models in daily_usage are present
+                # 使用保存的值更新 daily_usage，确保 daily_usage 中的所有模型都存在
+                for model_name in daily_usage.keys():
+                    daily_usage[model_name] = saved_usage.get(model_name, 0)
+                print("Loaded daily usage from previous session.")
+                # 从上一个会话加载每日使用量。
+            else:
+                # If the date is different, reset daily usage
+                # 如果日期不同，则重置每日使用量
+                print("New day detected. Resetting daily usage.")
+                # 检测到新的一天。正在重置每日使用量。
+                # Daily usage is already initialized to 0 at the start of the script.
+                # 每日使用量在脚本开始时已初始化为 0。
+
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"Error loading daily usage data from {usage_file}: {e}. Starting with fresh usage data.")
+        # 从 {usage_file} 加载每日使用量数据时出错：{e}。正在开始新的使用量数据。
+
+# Save the current daily usage and date
+# 保存当前的每日使用量和日期
+try:
+    with open(usage_file, 'w') as f:
+        json.dump({'date': today, 'usage': daily_usage}, f)
+    print(f"Saved initial daily usage to {usage_file}.")
+    # 已将初始每日使用量保存到 {usage_file}。
+except Exception as e:
+    print(f"Error saving daily usage data to {usage_file}: {e}")
+    # 将每日使用量数据保存到 {usage_file} 时出错：{e}
+
+
+# --- Setup and Data Loading ---
+# Ensure the image folder exists. If not, create it and prompt the user to upload images.
+# 确保图片文件夹存在。如果不存在，则创建它并提示用户上传图片。
+if not os.path.exists(image_folder):
+    os.makedirs(image_folder, exist_ok=True)
+    print(f"Folder '{image_folder}' not found, created. Please upload images to this folder.")
+    # Exit if no images are present after creating the folder, as there's nothing to process.
+    # 如果创建文件夹后没有图片，则退出，因为没有要处理的内容。
+    if not os.listdir(image_folder):
+        print("No images found in the specified folder. Please upload images and run the cell again.")
+        # 在指定文件夹中未找到图片。请上传图片并重新运行此单元格。
+        exit()
+
+# Load existing data from the output Excel file if it exists.
+# 如果输出Excel文件存在，则加载现有数据。
+# This allows resuming processing if the script was interrupted.
+# 这允许在脚本中断时恢复处理。
+try:
+    df = pd.read_excel(output_excel_file)
+    print(f"Loaded existing data from '{output_excel_file}'.")
+    # 已从“{output_excel_file}”加载现有数据。
+except FileNotFoundError:
+    # If the file doesn't exist, create a new DataFrame.
+    # 如果文件不存在，则创建一个新的DataFrame。
+    # Get a list of image files in the specified folder.
+    # 获取指定文件夹中的图片文件列表。
+    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+    # Create a DataFrame with filenames and initial status '未处理' (unprocessed).
+    # 创建一个包含文件名和初始状态“未处理”的DataFrame。
+    df = pd.DataFrame({'图片文件名': image_files, '识别出的文字': '未处理', '处理的模型': '未处理'})
+    print(f"'{output_excel_file}' not found. Created a new DataFrame for processing.")
+    # 未找到“{output_excel_file}”。已为处理创建新的DataFrame。
+
+# --- Image Processing and Retry Logic with Rate Limiting ---
+# This section iterates through the images that need processing and attempts to process them
+# using the configured models, respecting the daily rate limits.
+# 本节遍历需要处理的图片，并尝试使用配置的模型进行处理，同时遵守每日速率限制。
+# It includes a retry mechanism and switches models if a daily limit is reached.
+# 它包括重试机制，并在达到每日限制时切换模型。
+
+failed_in_loop = True  # Flag to track if any images failed in the current retry loop
+# 标记当前重试循环中是否有任何图片处理失败
+retry_count = 0        # Counter for retry loops
+# 重试循环计数器
+max_retries = 5        # Maximum number of retry loops to attempt
+# 最大重试循环次数
+
+# Continue retrying as long as there were failures in the previous loop and within the maximum retry count.
+# 只要上一个循环中有失败并且在最大重试次数内，就继续重试。
+while failed_in_loop and retry_count < max_retries:
+    failed_in_loop = False  # Assume no failures in this loop until one occurs.
+    # 假设此循环中没有失败，直到发生失败。
+    retry_count += 1
+    print(f"\nStarting retry loop {retry_count} of {max_retries}...")
+    # 开始重试循环 {retry_count} / {max_retries}...
+
+    # Identify images that still need processing.
+    # These are images marked as '未处理' or those that previously failed (indicated by '[处理文件出错:').
+    images_to_process_df = df[
+        (df['识别出的文字'] == '未处理') |
+        (df['识别出的文字'].str.contains(r'\[处理文件出错:'))
+    ].copy()
+
+    # If there are no images left to process, break out of the retry loop.
+    if images_to_process_df.empty:
+        print("All images processed successfully or marked as permanently failed.")
+        # 所有图片已成功处理或标记为永久失败。
+        break
+
+    print(f"Processing {len(images_to_process_df)} images in this loop.")
+    # 在此循环中处理 {len(images_to_process_df)} 张图片。
+
+    # Iterate through the images that need processing.
+    for index, row in images_to_process_df.iterrows():
+        filename = row['图片文件名']
+        image_path = os.path.join(image_folder, filename)
+        # Find the original index of this filename in the main DataFrame.
+        # This is important for updating the correct row in the main 'df'.
+        original_index = df[df['图片文件名'] == filename].index[0]
+
+        # Check if the image file still exists.
+        if not os.path.exists(image_path):
+            df.loc[original_index, '识别出的文字'] = f"[处理文件出错: 图片文件未找到: {filename}]"
+            df.loc[original_index, '处理的模型'] = '处理失败'
+            print(f"Error: Image file not found for {filename}. Marking as failed.")
+            # 错误：未找到 {filename} 的图片文件。正在标记为失败。
+            failed_in_loop = True # Mark failure to potentially trigger another retry loop
+            # 标记失败，以触发另一次重试循环
+            continue # Move to the next image
+            # 转到下一张图片
+
+        try:
+            # Open the image file.
+            img = Image.open(image_path)
+
+            # Define the prompt for the model.
+            prompt = [
+                "请识别图片中的所有文字，并将其提取出来。如果图片中没有文字，请描述图片内容。",
+                img
+            ]
+
+            # Attempt to process the image with each model in the defined order.
+            processed_successfully_with_any_model = False
+            for model_name in models_to_try:
+                # Check if the daily limit (RPD) for the current model is reached
+                # 检查当前模型的每日限制 (RPD) 是否已达到
+                if daily_usage.get(model_name, 0) >= rate_limits_rpd.get(model_name, float('inf')):
+                    print(f"Daily rate limit (RPD) reached for {model_name}. Skipping for {filename} in this loop.")
+                    # {model_name} 的每日速率限制 (RPD) 已达到。在此循环中跳过 {filename}。
+                    continue # Try the next model in the list
+                    # 尝试列表中的下一个模型
+
+                try:
+                    # Initialize the model.
+                    model = genai.GenerativeModel(model_name)
+                    print(f"Attempting to process {filename} with {model_name}...")
+                    # 尝试使用 {model_name} 处理 {filename}...
+                    # Call the model API to generate content based on the image and prompt.
+                    # 调用模型API根据图片和提示生成内容。
+                    response = model.generate_content(prompt, stream=False)
+                    # Extract the text from the model's response.
+                    extracted_text = response.text
+
+                    # If successful, update the main DataFrame with the result and the model used.
+                    # 如果成功，使用结果和使用的模型更新主DataFrame。
+                    df.loc[original_index, '识别出的文字'] = extracted_text
+                    df.loc[original_index, '处理的模型'] = model_name
+                    daily_usage[model_name] = daily_usage.get(model_name, 0) + 1 # Increment RPD usage
+                    # 增加 RPD 使用量
+                    print(f"Successfully processed {filename} with {model_name}. Daily RPD usage for {model_name}: {daily_usage[model_name]}")
+                    # 已成功使用 {model_name} 处理 {filename}。{model_name} 的每日 RPD 使用量：{daily_usage[model_name]}
+                    processed_successfully_with_any_model = True
+
+                    # Save updated daily usage immediately after a successful call
+                    # 在成功调用后立即保存更新后的每日使用量
+                    try:
+                        with open(usage_file, 'w') as f:
+                            json.dump({'date': today, 'usage': daily_usage}, f)
+                    except Exception as e:
+                        print(f"Error saving daily usage data: {e}")
+                        # 保存每日使用量数据时出错：{e}
+
+                    break # If successful with any model, no need to try other models for this image.
+                    # 如果使用任何模型成功，则无需尝试处理此图片的其余模型。
+
+                except Exception as e:
+                    # Handle exceptions during API calls.
+                    error_message = str(e)
+                    print(f"Attempt with {model_name} failed for {filename}: {error_message}")
+                    # 尝试使用 {model_name} 处理 {filename} 失败：{error_message}
+
+                    # Specifically handle rate limit errors (HTTP 429).
+                    # 特别处理速率限制错误（HTTP 429）。
+                    if "429" in error_message:
+                        print(f"Rate limit hit with {model_name} for {filename}. Waiting before retrying...")
+                        # 使用 {model_name} 处理 {filename} 时达到速率限制。正在等待重试...
+                        # Implement exponential backoff with jitter to avoid hitting the rate limit repeatedly.
+                        # 实现带有抖动的指数退避，以避免重复达到速率限制。
+                        # The sleep time increases with each retry attempt, with a random component (jitter).
+                        # 每次重试尝试都会增加睡眠时间，并带有随机分量（抖动）。
+                        # The maximum sleep time is capped at 60 seconds.
+                        # 最大睡眠时间上限为60秒。
+                        sleep_time = min(2 ** retry_count + random.random(), 60)
+                        print(f"Waiting for {sleep_time:.2f} seconds...")
+                        # 等待 {sleep_time:.2f} 秒...
+                        time.sleep(sleep_time)
+                        # Mark that a failure occurred in this loop to trigger another retry loop.
+                        # 标记此循环中发生了失败，以触发另一次重试循环。
+                        failed_in_loop = True
+                    else:
+                        # For other types of errors, record the error and mark as failed in this attempt.
+                        # 对于其他类型的错误，记录错误并在此尝试中标记为失败。
+                        df.loc[original_index, '识别出的文字'] = f"[处理文件出错: {model_name} 失败: {error_message}]"
+                        df.loc[original_index, '处理的模型'] = f"{model_name} 失败"
+                        failed_in_loop = True # Mark failure to potentially trigger another retry loop
+                        # 标记失败，以触发另一次重试循环
+
+            # If processing failed with all models after all attempts in this loop,
+            # 如果在此循环中的所有尝试后，所有模型都处理失败，
+            # update the '处理的模型' column to indicate complete failure for this image.
+            # 更新“处理的模型”列以指示此图片的完全失败。
+            if not processed_successfully_with_any_model:
+                 # Check if all models have reached their daily limits
+                 # 检查所有模型是否已达到每日限制
+                 all_models_rate_limited = all(
+                     daily_usage.get(model_name, 0) >= rate_limits_rpd.get(model_name, float('inf'))
+                     for model_name in models_to_try
+                 )
+
+                 if all_models_rate_limited:
+                     df.loc[original_index, '识别出的文字'] = f"[处理文件出错: 所有模型都达到每日速率限制]"
+                     df.loc[original_index, '处理的模型'] = '所有模型速率限制'
+                     print(f"Processing failed for {filename}: All models reached daily rate limits.")
+                     # 处理 {filename} 失败：所有模型都达到每日速率限制。
+                 else:
+                     df.loc[original_index, '处理的模型'] = '所有模型处理失败'
+                     # Keep failed_in_loop as True if any image failed all models to ensure the outer loop continues
+                     # if there are still images being processed in the next retry.
+                     # 如果任何图片所有模型都处理失败，则将failed_in_loop保持为True，以确保外部循环继续
+                     # 如果在下一次重试中仍有图片正在处理。
+
+
+        except Exception as e:
+            # Handle errors that occur before calling the API, such as issues opening the image file.
+            # 处理在调用API之前发生的错误，例如打开图片文件时的问题。
+            df.loc[original_index, '识别出的文字'] = f"[处理文件出错: 打开图片失败: {e}]"
+            df.loc[original_index, '处理的模型'] = '处理失败'
+            print(f"Error opening image file {filename}: {e}")
+            # 打开图片文件 {filename} 时出错：{e}
+            failed_in_loop = True # Mark failure to potentially trigger another retry loop
+            # 标记失败，以触发另一次重试循环
+
+# --- Final Output ---
+# After the retry loop completes (either all images processed or max retries reached),
+# 在重试循环完成后（所有图片已处理或达到最大重试次数），
+# save the final state of the DataFrame to the Excel file.
+# 将DataFrame的最终状态保存到Excel文件。
+
+# Ensure the output directory exists before saving the file.
+output_dir = os.path.dirname(output_excel_file)
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+# Create a new workbook and write the data from the updated DataFrame.
+# 创建一个新工作簿，并写入更新后的DataFrame中的数据。
+workbook = Workbook()
+sheet = workbook.active
+sheet.title = "图片文字识别结果" # Sheet title: Image Text Recognition Results
+
+# Write the header row.
+# 写入标题行。
+sheet['A1'] = '图片文件名' # Image Filename
+sheet['B1'] = '识别出的文字' # Recognized Text
+sheet['C1'] = '处理的模型' # Processing Model
+
+# Write the data rows from the DataFrame to the Excel sheet.
+# 将DataFrame中的数据行写入Excel工作表。
+# Start from the second row (index 2 in Excel, which corresponds to index 1 in the loop).
+# 从第二行开始（Excel中索引为2，对应循环中索引为1）。
+for r_idx, row in df.iterrows():
+    sheet[f'A{r_idx + 2}'] = row['图片文件名']
+    sheet[f'B{r_idx + 2}'] = row['识别出的文字']
+    sheet[f'C{r_idx + 2}'] = row['处理的模型']
+
+# Save the Excel file.
+# 保存Excel文件。
+workbook.save(output_excel_file)
+
+print("---")
+print(f"All image processing attempts completed. Final results saved to Excel file: {output_excel_file}")
+# 所有图片处理尝试已完成。最终结果已保存到Excel文件：{output_excel_file}
